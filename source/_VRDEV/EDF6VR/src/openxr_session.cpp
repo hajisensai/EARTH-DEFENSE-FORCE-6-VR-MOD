@@ -160,6 +160,13 @@ void NoteControllerKind(const char* path) noexcept {
     g_controllerKind[n]=0;
 }
 XrInstance g_instance=XR_NULL_HANDLE;
+// Set by CreateSession when the runtime answered xrGetSystem with FORM_FACTOR_UNAVAILABLE.
+bool g_noHeadset=false;
+// Instances made so far, for the log and the tests: a start that finds no headset keeps its instance,
+// so the automatic retries (every 3 s, on the game's threads) only ask xrGetSystem again. Measured in
+// process with Virtual Desktop's runtime and no headset (2026-09-29): a retry that made a new instance
+// took about 1.2 ms (the first start 7.6 ms, plus loading the runtime DLL); one that asks again, 0.01 ms.
+unsigned g_instancesCreated=0;
 XrSession g_session=XR_NULL_HANDLE;
 XrSpace g_viewSpace=XR_NULL_HANDLE;
 XrSpace g_refSpace=XR_NULL_HANDLE;
@@ -550,6 +557,7 @@ bool CreateInstance() noexcept {
         create.applicationInfo.apiVersion=g_runtimeApiVersion;
         result=g_api.createInstance(&create,&g_instance);
     }
+    if(XR_SUCCEEDED(result)) ++g_instancesCreated;
     if(XR_FAILED(result)) {
         // Report the plain 1.0 attempt: the fallback's own error is rarely the cause.
         SetStatusf("xrCreateInstance failed (%d); connect the headset to the selected OpenXR runtime first",
@@ -1189,6 +1197,9 @@ bool CreateSession() noexcept {
     XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor=XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XrResult result=g_api.getSystem(g_instance,&systemInfo,&g_system);
+    // The runtime is there but no headset is: nothing but the instance exists yet, and the spec
+    // calls this transient, to be asked again on the same instance (Start keeps it for that).
+    g_noHeadset=result==XR_ERROR_FORM_FACTOR_UNAVAILABLE;
     if(XR_FAILED(result)) {
         SetStatusf("xrGetSystem failed (%d); connect the headset in SteamVR, Quest Link or Virtual Desktop for the active runtime",static_cast<int>(result));
         return false;
@@ -1701,7 +1712,9 @@ void ResetInput() noexcept {
     ReleaseSRWLockExclusive(&g_handLock);
     strcpy_s(g_inputNote,"input not set up");
 }
-void Teardown() noexcept {
+// keepInstance: only after a start that found no headset (g_noHeadset), when the instance is the one
+// thing that exists; it and the runtime's entry points stay for the next start to ask again.
+void Teardown(bool keepInstance=false) noexcept {
     g_displayFramePrepared=false;
     g_preparedFrame={XR_TYPE_FRAME_STATE};
     g_displayOwnerThread=0;
@@ -1718,8 +1731,10 @@ void Teardown() noexcept {
     g_refSpace=XR_NULL_HANDLE;
     if(g_session && g_api.destroySession) g_api.destroySession(g_session);
     g_session=XR_NULL_HANDLE;
-    if(g_instance && g_api.destroyInstance) g_api.destroyInstance(g_instance);
-    g_instance=XR_NULL_HANDLE;
+    if(!keepInstance) {
+        if(g_instance && g_api.destroyInstance) g_api.destroyInstance(g_instance);
+        g_instance=XR_NULL_HANDLE;
+    }
     // The game device is borrowed; only release one we created ourselves.
     if(g_ownDevice) {
         if(g_context) g_context->Release();
@@ -1729,7 +1744,7 @@ void Teardown() noexcept {
     g_device=nullptr;
     g_ownDevice=false;
     g_sessionRunning.store(false);
-    g_api=Api{};
+    if(!keepInstance) g_api=Api{};
     g_system=XR_NULL_SYSTEM_ID;
 }
 
@@ -2836,8 +2851,13 @@ bool OpenXrRuntime::Start(VrLogger log,XrMode mode,void* gameDevice,void* gameCo
     g_ownDevice=(mode!=XrMode::HeadsetDisplay);
     g_device=g_ownDevice?nullptr:static_cast<ID3D11Device*>(gameDevice);
     g_context=g_ownDevice?nullptr:static_cast<ID3D11DeviceContext*>(gameContext);
-    const bool ok=NegotiateRuntime() && CreateInstance() && CreateSession();
-    if(!ok) Teardown();
+    // An instance left by a start that found no headset is asked again as it is: no new runtime
+    // negotiation and no new instance, which is what each automatic retry (every 3 s on the game's render
+    // and camera threads, under g_frameLock) did before 2.1.6 (see g_instancesCreated for the timings).
+    const bool kept=g_instance!=XR_NULL_HANDLE;
+    g_noHeadset=false;
+    const bool ok=(kept || (NegotiateRuntime() && CreateInstance())) && CreateSession();
+    if(!ok) Teardown(g_noHeadset);
     ReleaseSRWLockExclusive(&g_frameLock);
     if(!ok) return false;
     g_running.store(true);
