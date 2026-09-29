@@ -50,7 +50,6 @@ void HeliLayoutTest(bool baked=true) {
             CHECK(seen*6>=total);
         } else {
             const float floorY=shell.floor-(shell.eye[1]-kCockpitSeatedEye[1]);unsigned seen=0,total=0;
-            const float nose=shell.stations[shell.stationCount-1][0];
             auto wf=[&](float z){for(unsigned i=0;i+1<shell.stationCount;++i)if(z<=shell.stations[i+1][0]) {
                 const float t=(z-shell.stations[i][0])/(shell.stations[i+1][0]-shell.stations[i][0]);
                 return shell.stations[i][1]+(shell.stations[i+1][1]-shell.stations[i][1])*t;}return shell.stations[shell.stationCount-1][1];};
